@@ -33,6 +33,7 @@ class Settings(BaseSettings):
     # Job Configuration
     DEFAULT_RETENTION_DAYS: int = 30
     DEFAULT_LEASE_TIMEOUT_SECONDS: int = 60
+    GLOBAL_CONCURRENCY_CAP: int = 1000
     
     # Redis (Optional mostly for rate limiting if we get to it)
     REDIS_URL: str = "redis://localhost:6379/0"

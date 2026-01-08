@@ -1,7 +1,11 @@
-from sqlalchemy.ext.asyncio import AsyncSession
+import random
 from typing import Optional
-from app.db.models import Job, JobLease
+from sqlalchemy import select, func, and_
+from sqlalchemy.ext.asyncio import AsyncSession
+
+from app.db.models import Job, JobLease, Tenant
 from app.commands.lease_job import lease_job
+from app.settings import settings
 
 async def dispatch_lease(
     session: AsyncSession,
@@ -10,9 +14,55 @@ async def dispatch_lease(
     lease_duration: Optional[int] = None
 ) -> Optional[tuple[Job, JobLease]]:
     """
-    Dispatcher facade. 
-    In the future, this can include rate limiting checks (e.g. Redis check)
-    before calling the DB lease command.
+    Dispatcher facade with Fairness and Rate Limiting.
     """
-    # TODO: Add Rate Limiting here
-    return await lease_job(session, worker_id, tenant_id, lease_duration=lease_duration)
+    # 1. Global Concurrency Check
+    # We count only Valid (non-expired) leases
+    q_global = select(func.count()).select_from(JobLease).where(JobLease.expires_at > func.now())
+    global_count = (await session.execute(q_global)).scalar() or 0
+    
+    if global_count >= settings.GLOBAL_CONCURRENCY_CAP:
+        return None
+
+    # 2. Targeted Lease (if worker is restricted to a tenant)
+    if tenant_id:
+        return await lease_job(session, worker_id, tenant_id, lease_duration=lease_duration)
+
+    # 3. Fair Leasing (Weighted Random Selection)
+    # Fetch all tenants and their inflight counts
+    # Inflight = Active Leases (not expired)
+    stmt = (
+        select(
+            Tenant, 
+            func.count(JobLease.job_id).label("inflight")
+        )
+        .outerjoin(Job, Job.tenant_id == Tenant.id)
+        .outerjoin(JobLease, and_(JobLease.job_id == Job.id, JobLease.expires_at > func.now()))
+        .group_by(Tenant.id)
+    )
+    
+    rows = (await session.execute(stmt)).all()
+    
+    candidate_pool = []
+    for tenant, inflight in rows:
+        if inflight < tenant.max_inflight:
+            candidate_pool.append(tenant)
+            
+    if not candidate_pool:
+        return None
+        
+    # Attempt to lease from candidates
+    while candidate_pool:
+        # Weighted selection
+        weights = [t.weight for t in candidate_pool]
+        chosen_tenant = random.choices(candidate_pool, weights=weights, k=1)[0]
+        
+        # Try to lease
+        res = await lease_job(session, worker_id, tenant_id=chosen_tenant.id, lease_duration=lease_duration)
+        if res:
+            return res
+            
+        # If no jobs found for this tenant, remove and retry
+        candidate_pool.remove(chosen_tenant)
+        
+    return None
