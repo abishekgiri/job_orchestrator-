@@ -21,12 +21,15 @@ class JobCreate(BaseModel):
     idempotency_key: Optional[str] = None
     max_attempts: int = 3
     execution_timeout: Optional[int] = None
+    run_at: Optional[datetime] = None # Alias for available_at
+    cron_schedule: Optional[str] = None
 
 class JobResponse(BaseModel):
     id: UUID
     tenant_id: str
     status: JobStatus
     payload: dict[str, Any]
+    cron_schedule: Optional[str] = None
     result: Optional[dict[str, Any]] = None
     attempts: int
     last_error: Optional[str]
@@ -46,6 +49,18 @@ async def create_job(payload: JobCreate, session: DbSession):
         if existing:
             return existing
 
+    # Determine initial status and availability
+    now = datetime.now().astimezone()
+    available_at = payload.run_at if payload.run_at else now
+    
+    initial_status = JobStatus.PENDING
+    if available_at > now + timedelta(seconds=1): # Buffer
+         initial_status = JobStatus.SCHEDULED
+    
+    # If cron provided, we might need to calculate first run if run_at not explicitly given?
+    # For simplicity: if cron is set, and run_at is NOT set, calculate next valid time?
+    # Or just start immediately? Let's respect run_at if given, else now.
+    
     job = Job(
         tenant_id=payload.tenant_id,
         payload=payload.payload,
@@ -53,7 +68,9 @@ async def create_job(payload: JobCreate, session: DbSession):
         idempotency_key=payload.idempotency_key,
         max_attempts=payload.max_attempts,
         execution_timeout=payload.execution_timeout,
-        status=JobStatus.PENDING
+        status=initial_status,
+        available_at=available_at,
+        cron_schedule=payload.cron_schedule
     )
     session.add(job)
     await session.flush()

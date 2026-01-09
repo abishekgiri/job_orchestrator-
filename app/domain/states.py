@@ -2,6 +2,7 @@ from enum import StrEnum, auto
 
 class JobStatus(StrEnum):
     PENDING = auto()          # Created, waiting for lease
+    SCHEDULED = auto()        # Scheduled for future execution
     LEASED = auto()           # Picked up by a worker
     RUNNING = auto()          # Worker has started execution (optional ack)
     SUCCEEDED = auto()        # Completed successfully

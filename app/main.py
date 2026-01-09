@@ -8,9 +8,15 @@ from app.api.v1.metrics import router as metrics_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Initialize things if needed
+    # Startup
+    from app.scheduler.service import SchedulerService
+    scheduler = SchedulerService()
+    await scheduler.start()
+    
     yield
-    # Shutdown: Clean up connections
+    
+    # Shutdown
+    await scheduler.stop()
 
 app = FastAPI(
     title=settings.PROJECT_NAME,

@@ -107,6 +107,38 @@ async def lease_job(
     )
     session.add(event)
     
+    # Handle Cron Recurrence
+    if job.cron_schedule:
+        try:
+            from croniter import croniter
+            # Calculate next run time
+            # base_time: use the job's scheduled available_at to prevent drift, or now if it was immediate
+            # Ensure timezone awareness handling
+            base_time = job.available_at if job.available_at else now
+            iter = croniter(job.cron_schedule, base_time)
+            next_run = iter.get_next(datetime)
+            
+            # Create next job instance
+            next_job = Job(
+                tenant_id=job.tenant_id,
+                payload=job.payload,
+                priority=job.priority, # Inherit base priority
+                idempotency_key=None, # Reset idempotency for new instance (or generate new one?)
+                max_attempts=job.max_attempts,
+                execution_timeout=job.execution_timeout,
+                status=JobStatus.SCHEDULED,
+                available_at=next_run,
+                cron_schedule=job.cron_schedule
+            )
+            session.add(next_job)
+            
+        except ImportError:
+            # In case croniter is missing, we log or ignore? 
+            # For this context, we assume it's installed.
+            print("Warning: croniter not installed, cannot schedule next recurrence.")
+        except Exception as e:
+            print(f"Error scheduling next cron job: {e}")
+
     # We commit in the caller usually, but commands might be self-contained?
     # Usually better to let caller commit to allow composition.
     # But for a "lease" command, it implies a transaction.

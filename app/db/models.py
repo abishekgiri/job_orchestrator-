@@ -39,6 +39,7 @@ class Job(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), onupdate=text("now()"))
     available_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), index=True)
+    cron_schedule: Mapped[Optional[str]] = mapped_column(String, nullable=True) # Cron expression, e.g. "* * * * *"
     started_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
     execution_timeout: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
     
