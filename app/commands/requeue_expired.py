@@ -68,5 +68,9 @@ async def requeue_expired_jobs(session: AsyncSession, limit: int = 100) -> int:
             meta={"reason": "lease_expired", "worker_id": lease.worker_id}
         ))
         
+    if count > 0:
+        from app.api.v1.metrics import REAPER_RECOVERED_JOBS
+        REAPER_RECOVERED_JOBS.inc(count)
+        
     await session.flush()
     return count

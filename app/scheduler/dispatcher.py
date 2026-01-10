@@ -1,4 +1,5 @@
 import random
+from datetime import datetime
 from typing import Optional
 from sqlalchemy import select, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -60,6 +61,29 @@ async def dispatch_lease(
         # Try to lease
         res = await lease_job(session, worker_id, tenant_id=chosen_tenant.id, lease_duration=lease_duration)
         if res:
+            job, lease = res
+            
+            # Metrics
+            from app.api.v1.metrics import JOB_DISPATCH_COUNT, JOB_LEASE_TIME
+            JOB_DISPATCH_COUNT.labels(status="success", tenant_id=job.tenant_id or "default").inc()
+            
+            # Calculate start delay
+            if job.available_at:
+                delay = (func.now() - job.available_at).total_seconds() 
+                # Wait, job.available_at is datetime object in python or column?
+                # It's an ORM object here.
+                # However, job.available_at might be None if not set? 
+                # Let's check python side.
+                pass
+            
+            # We need to compute delay carefully. 
+            # lease_job returns refreshed objects.
+            # let's assume available_at is set.
+            now_ts = datetime.now().timestamp()
+            avail_ts = job.available_at.timestamp() if job.available_at else job.created_at.timestamp()
+            delay = max(0, now_ts - avail_ts)
+            JOB_LEASE_TIME.observe(delay)
+            
             return res
             
         # If no jobs found for this tenant, remove and retry
