@@ -51,8 +51,12 @@ class FailRequest(BaseModel):
     lease_token: UUID
     error: str
 
+from fastapi import APIRouter, HTTPException, status, Depends
+from app.auth.security import SignatureVerifier
+from app.db.models import Tenant
+
 @router.post("/poll", response_model=Optional[PollResponse])
-async def poll_job(body: PollRequest, session: DbSession):
+async def poll_job(body: PollRequest, session: DbSession, tenant: Tenant = Depends(SignatureVerifier())):
     result = await dispatch_lease(
         session, 
         worker_id=body.worker_id, 
@@ -74,7 +78,7 @@ async def poll_job(body: PollRequest, session: DbSession):
     )
 
 @router.post("/{job_id}/heartbeat")
-async def job_heartbeat(job_id: UUID, body: HeartbeatRequest, session: DbSession):
+async def job_heartbeat(job_id: UUID, body: HeartbeatRequest, session: DbSession, tenant: Tenant = Depends(SignatureVerifier())):
     try:
         new_expires_at = await heartbeat(
             session, 
@@ -88,7 +92,7 @@ async def job_heartbeat(job_id: UUID, body: HeartbeatRequest, session: DbSession
         raise HTTPException(status_code=409, detail=str(e))
 
 @router.post("/{job_id}/complete")
-async def job_complete(job_id: UUID, body: CompleteRequest, session: DbSession):
+async def job_complete(job_id: UUID, body: CompleteRequest, session: DbSession, tenant: Tenant = Depends(SignatureVerifier())):
     try:
         job = await complete_job(
             session, 
@@ -103,7 +107,7 @@ async def job_complete(job_id: UUID, body: CompleteRequest, session: DbSession):
         raise HTTPException(status_code=400, detail=str(e))
 
 @router.post("/{job_id}/fail")
-async def job_fail(job_id: UUID, body: FailRequest, session: DbSession):
+async def job_fail(job_id: UUID, body: FailRequest, session: DbSession, tenant: Tenant = Depends(SignatureVerifier())):
     try:
         job = await fail_job(
             session, 

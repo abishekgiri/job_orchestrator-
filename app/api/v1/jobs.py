@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
@@ -37,8 +37,15 @@ class JobResponse(BaseModel):
     execution_timeout: Optional[int] = None
     model_config = ConfigDict(from_attributes=True)
 
+from fastapi import APIRouter, HTTPException, BackgroundTasks, status, Depends
+from app.auth.security import get_current_tenant
+from app.db.models import Tenant
+
 @router.post("", response_model=JobResponse, status_code=status.HTTP_201_CREATED)
-async def create_job(payload: JobCreate, session: DbSession):
+async def create_job(payload: JobCreate, session: DbSession, current_tenant: Tenant = Depends(get_current_tenant)):
+    # Validate tenant ownership
+    if payload.tenant_id != current_tenant.id:
+         raise HTTPException(status_code=403, detail="Cannot create job for another tenant")
     # Check idempotency
     if payload.idempotency_key:
         stmt = select(Job).where(
@@ -94,10 +101,13 @@ async def create_job(payload: JobCreate, session: DbSession):
     return job
 
 @router.get("/{job_id}", response_model=JobResponse)
-async def get_job(job_id: UUID, session: DbSession):
+async def get_job(job_id: UUID, session: DbSession, current_tenant: Tenant = Depends(get_current_tenant)):
     job = await session.get(Job, job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+        
+    if job.tenant_id != current_tenant.id:
+        raise HTTPException(status_code=404, detail="Job not found") # Mask existence
     return job
 
 @router.post("/{job_id}/cancel", response_model=JobResponse)

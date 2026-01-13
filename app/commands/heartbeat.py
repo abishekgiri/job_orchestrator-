@@ -75,14 +75,6 @@ async def heartbeat(
     lease.last_heartbeat_at = now
     lease.expires_at = new_expires_at
     
-    # Optional: Log heartbeat event? (Maybe too noisy, only log periodically or debug)
-    # Using JobEvent.LEASE_RENEWED
-    # event = JobEventLog(
-    #     job_id=job_id,
-    #     event_type=JobEvent.LEASE_RENEWED,
-    #     meta={"new_expires_at": str(new_expires_at)}
-    # )
-    # session.add(event)
-    
+    # Heartbeat successful. Optional: log event.
     await session.flush()
     return new_expires_at

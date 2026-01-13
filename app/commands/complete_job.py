@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Optional
 from uuid import UUID
 
@@ -6,9 +6,9 @@ from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from sqlalchemy.exc import IntegrityError
-from app.db.models import Job, JobLease, JobEventLog, JobCompletion
+from app.db.models import Job, JobLease, JobEventLog, JobCompletion, OutboxEvent
 from app.domain.states import JobStatus, JobEvent
-from app.api.v1.metrics import JOB_DURATION
+from app.api.v1.metrics import JOB_DURATION, JOB_COMPLETE_TOTAL
 from app.domain.errors import JobNotFoundError, InvalidJobStateError
 
 async def complete_job(
@@ -114,18 +114,34 @@ async def complete_job(
     # To measure duration we ideally need lease.created_at or similar.
     # I'll skip accurate duration for now or calculate approx if I can.
     # Job updated_at might be when it was leased?
-    if job.updated_at:
-        duration = (datetime.now() - job.updated_at.replace(tzinfo=None)).total_seconds()
-        # Ensure positive
+    # Observe duration
+    # We need start time.
+    if job.started_at: # Using started_at if available, else updated_at
+        # Both aware (UTC)
+        duration = (datetime.now(timezone.utc) - job.started_at).total_seconds()
         if duration > 0:
             JOB_DURATION.observe(duration)
-        
+    
+    # Metrics
+    JOB_COMPLETE_TOTAL.labels(tenant_id=job.tenant_id, result="success").inc()
+
     # Log Event
     session.add(JobEventLog(
         job_id=job.id,
         event_type=JobEvent.COMPLETED,
         timestamp=now,
         meta={"lease_token": str(lease_token) if lease_token else None}
+    ))
+
+    # Outbox Event (Transactional Guarantee)
+    session.add(OutboxEvent(
+        event_type="JOB_COMPLETED",
+        payload={
+             "job_id": str(job.id),
+             "tenant_id": job.tenant_id,
+             "result": result_data,
+             "completed_at": now.isoformat()
+        }
     ))
     
     await session.flush()

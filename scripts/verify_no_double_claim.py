@@ -7,30 +7,69 @@ import time
 
 API_URL = "http://localhost:8000"
 
-async def attempt_lease(worker_id, tenant_id):
+import hashlib
+import hmac
+import json
+import uuid
+# ... imports ...
+
+API_URL = "http://localhost:8000"
+
+async def attempt_lease(worker_id, tenant_id, api_key):
     async with httpx.AsyncClient(base_url=API_URL) as client:
         try:
-            resp = await client.post("/api/v1/workers/poll", json={
+            # Manual Sign
+            payload = {
                 "worker_id": worker_id,
                 "tenant_id": tenant_id
-            }, timeout=5.0)
+            }
+            content = json.dumps(payload).encode("utf-8")
+            sig = hmac.new(api_key.encode(), content, hashlib.sha256).hexdigest()
+            
+            resp = await client.post("/api/v1/workers/poll", 
+                content=content,
+                headers={
+                    "X-Tenant-ID": tenant_id,
+                    "X-Worker-Signature": sig,
+                    "Content-Type": "application/json"
+                }, 
+                timeout=5.0
+            )
             if resp.status_code == 200:
                 result = resp.json()
-                result['worker_id'] = worker_id
-                return result
+                if result: # Might be None
+                    result['worker_id'] = worker_id
+                    return result
         except Exception:
             pass
     return None
 
 async def verify_no_double_claim():
     tenant_id = f"tenant-concurrency-{uuid.uuid4()}"
+    api_key = f"key-concurrency-{uuid.uuid4()}"
+    
+    # 0. Setup Tenant
+    async with httpx.AsyncClient(base_url=API_URL) as client:
+        try:
+             await client.post("/api/v1/admin/tenants", json={
+                "id": tenant_id, 
+                "name": "Concurrency Tenant", 
+                "api_key": api_key,
+                "max_inflight": 20 # Enough for test
+            })
+        except Exception:
+             pass 
+
     # 1. Create 1 job
     async with httpx.AsyncClient(base_url=API_URL) as client:
         print("1. Creating 1 job...")
-        resp = await client.post("/api/v1/jobs", json={
-            "tenant_id": tenant_id,
-            "payload": {"task": "concurrency_test"}
-        })
+        resp = await client.post("/api/v1/jobs", 
+            headers={"X-API-Key": api_key},
+            json={
+                "tenant_id": tenant_id,
+                "payload": {"task": "concurrency_test"}
+            }
+        )
         resp.raise_for_status()
         job_id = resp.json()["id"]
         print(f"   Job created: {job_id}")
@@ -39,7 +78,7 @@ async def verify_no_double_claim():
     print("2. Spawning 20 concurrent lease attempts...")
     tasks = []
     for i in range(20):
-        tasks.append(attempt_lease(f"worker-{i}", tenant_id))
+        tasks.append(attempt_lease(f"worker-{i}", tenant_id, api_key))
     
     # Run them all at once
     results = await asyncio.gather(*tasks)

@@ -10,30 +10,40 @@ API_URL = "http://localhost:8000"
 
 async def verify_retry_dlq():
     tenant_id = f"tenant-retry-{uuid.uuid4()}"
+    api_key = f"key-retry-{uuid.uuid4()}"
+    
+    # 0. Setup Tenant
+    async with httpx.AsyncClient(base_url=API_URL) as client:
+        try:
+             await client.post("/api/v1/admin/tenants", json={
+                "id": tenant_id, 
+                "name": "Retry Tenant", 
+                "api_key": api_key,
+                "max_inflight": 10
+            })
+        except Exception:
+             pass
+
     # 1. Create a job with max_attempts=2
-    # This means:
-    # Attempt 1: Fail -> Retry (attempts=1)
-    # Attempt 2: Fail -> DLQ (attempts=2 >= max_attempts?)
-    # Wait, usually max_attempts includes the first one. 
-    # If max_attempts=2:
-    # 1. Run -> Fail. Count=1. 1 < 2 -> Retry.
-    # 2. Run -> Fail. Count=2. 2 >= 2 -> DLQ.
     async with httpx.AsyncClient(base_url=API_URL) as client:
         print("1. Creating job with max_attempts=2...")
-        resp = await client.post("/api/v1/jobs", json={
-            "tenant_id": tenant_id,
-            "max_attempts": 2,
-            "payload": {"task": "fail_test"}
-        })
+        resp = await client.post("/api/v1/jobs", 
+            headers={"X-API-Key": api_key},
+            json={
+                "tenant_id": tenant_id,
+                "max_attempts": 2,
+                "payload": {"task": "fail_test"}
+            }
+        )
         resp.raise_for_status()
         job_id = resp.json()["id"]
         print(f"   Job created: {job_id}")
 
-    client_a = WorkerClient(API_URL, worker_id="worker-fail-test")
+    client_a = WorkerClient(API_URL, worker_id="worker-fail-test", tenant_id=tenant_id, api_key=api_key)
     
     # 2. Attempt 1
     print("2. Worker attempting lease (Attempt 1)...")
-    job_data = await client_a.poll(tenant_id=tenant_id)
+    job_data = await client_a.poll() # Uses tenant_id/api_key from init
     if not job_data or job_data['job']['id'] != job_id:
         print("   FAILURE: Could not lease job for attempt 1")
         return
@@ -43,7 +53,7 @@ async def verify_retry_dlq():
     
     # 3. Verify state
     async with httpx.AsyncClient(base_url=API_URL) as client:
-        resp = await client.get(f"/api/v1/jobs/{job_id}")
+        resp = await client.get(f"/api/v1/jobs/{job_id}", headers={"X-API-Key": api_key})
         job = resp.json()
         print(f"   Status after fail 1: {job['status']}")
         print(f"   Attempts: {job['attempts']}")
@@ -64,20 +74,24 @@ async def verify_retry_dlq():
     await asyncio.sleep(25)
     
     print("5. Worker attempting lease (Attempt 2)...")
-    job_data_2 = await client_a.poll(tenant_id=tenant_id)
+    job_data_2 = await client_a.poll()
     if not job_data_2 or job_data_2['job']['id'] != job_id:
          # Retry might need more time or polling?
          # If not found, maybe available_at is further out?
          # Let's try polling a few times
          print("   Job not immediately available. Polling...")
          for _ in range(5):
-             job_data_2 = await client_a.poll(tenant_id=tenant_id)
+             job_data_2 = await client_a.poll()
              if job_data_2 and job_data_2['job']['id'] == job_id:
                  break
              await asyncio.sleep(1)
              
     if not job_data_2 or job_data_2['job']['id'] != job_id:
         print("   FAILURE: Could not lease job for attempt 2 (after backoff)")
+        # Debug info
+        async with httpx.AsyncClient(base_url=API_URL) as client:
+             r = await client.get(f"/api/v1/jobs/{job_id}", headers={"X-API-Key": api_key})
+             print(f"   Debug Status: {r.json()}")
         return
 
     print("   Leased job for attempt 2. Failing it...")
@@ -85,7 +99,7 @@ async def verify_retry_dlq():
 
     # 5. Verify DLQ
     async with httpx.AsyncClient(base_url=API_URL) as client:
-        resp = await client.get(f"/api/v1/jobs/{job_id}")
+        resp = await client.get(f"/api/v1/jobs/{job_id}", headers={"X-API-Key": api_key})
         job = resp.json()
         print(f"   Status after fail 2: {job['status']}")
         

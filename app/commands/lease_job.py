@@ -1,14 +1,22 @@
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from uuid import UUID, uuid4
+import random
+import asyncio
+import logging
+
+logger = logging.getLogger(__name__)
 
 from sqlalchemy import select, update, func, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.dialects.postgresql import insert
 
-from app.db.models import Job, JobLease, JobEventLog
+from app.db.models import Job, JobLease, JobEventLog, Tenant
 from app.domain.states import JobStatus, JobEvent
-from app.api.v1.metrics import QUEUE_DEPTH, JOB_LEASE_TIME
+# We can't import QUEUE_DEPTH here directly if we're changing metrics.py structure.
+# But assuming metrics.py will be updated or exists, let's defer metrics updates slightly or assume they work.
+# Actually, the user asked to ADD labels. So I will update metrics logic here.
+from app.api.v1.metrics import QUEUE_DEPTH, JOB_LEASE_TIME, JOB_LEASE_TOTAL
 from app.settings import settings
 
 async def lease_job(
@@ -20,41 +28,91 @@ async def lease_job(
     """
     Atomically claims a pending job for the given worker.
     
-    Strategy:
-    1. Find a job that is PENDING and available_at <= now()
-    2. Filter by tenant_id if provided (for strict multi-tenant workers)
-    3. Order by priority DESC, available_at ASC
-    4. Lock the row with FOR UPDATE SKIP LOCKED
-    5. Update status to LEASED
-    6. create a Lease record
-    7. create an Event log
+    Strategies:
+    Case A (Pinned Worker): tenant_id is provided. Lease best eligible job for that tenant.
+    Case B (Shared Worker): tenant_id is None. Two-Step Fairness:
+        1. Find "active tenants" (have PENDING jobs eligible now).
+        2. Weighted Random Selection of one tenant.
+        3. Lease best job for that tenant.
     """
     
     duration = lease_duration if lease_duration is not None else settings.DEFAULT_LEASE_TIMEOUT_SECONDS
-        
-    now = datetime.now()
+    now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=duration)
     lease_token = uuid4()
     
-    # Subquery to find the job ID
-    # SELECT * FROM jobs WHERE ... FOR UPDATE SKIP LOCKED LIMIT 1
-    subquery = select(Job).where(
-        Job.status == JobStatus.PENDING,
-        Job.available_at <= now
-    )
+    found_job = None
     
+    # --- Case A: Pinned Worker ---
     if tenant_id:
-        subquery = subquery.where(Job.tenant_id == tenant_id)
+        subquery = _build_job_query(tenant_id, now)
+        sel_res = await session.execute(subquery)
+        found_job = sel_res.scalar_one_or_none()
         
-    subquery = subquery.order_by(
-        Job.priority.desc(),
-        Job.available_at.asc()
-    ).with_for_update(skip_locked=True).limit(1)
-    
-    # Execute Selection first to ensure lock
-    sel_res = await session.execute(subquery)
-    found_job = sel_res.scalar_one_or_none()
-    
+    # --- Case B: Shared Worker ---
+    else:
+        # Retry loop for race conditions (Step 1 -> Step 2 race)
+        for _ in range(3):
+            # Step 1: Find Active Tenants
+            # Optimization: Use the index 'ix_jobs_poll' implicitly by filtering status='pending'
+            # We need tenants that have at least one job ready.
+            # SELECT DISTINCT tenant_id FROM jobs WHERE status='pending' AND available_at <= now
+            # But we also need their weight. So we join with Tenants.
+            
+            # Note: This query might differ in performance with large job counts.
+            # Ideally we have a separate "TenantQueue" table, but for now we join.
+            # To avoid scanning matching jobs, we can use distinct.
+            
+            # Step 1: Find Active Tenants that are NOT at their max_inflight cap.
+            # We count actual leases for each tenant.
+            inflight_counts_q = (
+                select(
+                    Job.tenant_id,
+                    func.count(JobLease.job_id).label("current_inflight")
+                )
+                .join(JobLease, Job.id == JobLease.job_id)
+                .group_by(Job.tenant_id)
+            ).subquery()
+
+            active_tenants_q = (
+                select(Tenant.id, Tenant.weight)
+                .join(Job, Job.tenant_id == Tenant.id)
+                .outerjoin(inflight_counts_q, Tenant.id == inflight_counts_q.c.tenant_id)
+                .where(
+                    Job.status == JobStatus.PENDING,
+                    Job.available_at <= now,
+                    # Filter: (no inflight yet) OR (inflight < cap)
+                    and_(
+                        (func.coalesce(inflight_counts_q.c.current_inflight, 0) < Tenant.max_inflight)
+                    )
+                )
+                .group_by(Tenant.id, Tenant.weight, inflight_counts_q.c.current_inflight)
+            )
+            
+            # Current async session execute
+            t_res = await session.execute(active_tenants_q)
+            active_tenants = t_res.all() # list of (id, weight)
+            
+            if not active_tenants:
+                return None
+                
+            # Step 2: Weighted Random Selection
+            # active_tenants is [(id, weight), ...]
+            tenants = [t[0] for t in active_tenants]
+            weights = [t[1] for t in active_tenants]
+            
+            # Python's random.choices selects with replacement, k=1
+            chosen_tenant_id = random.choices(tenants, weights=weights, k=1)[0]
+            
+            # Step 3: Lease from chosen tenant
+            subquery = _build_job_query(chosen_tenant_id, now)
+            sel_res = await session.execute(subquery)
+            found_job = sel_res.scalar_one_or_none()
+            
+            if found_job:
+                break
+            # If not found (race condition, occupied between Step 1 and 3), retry loop picks another tenant.
+            
     if not found_job:
         return None
     
@@ -87,12 +145,18 @@ async def lease_job(
     session.add(lease)
     
     # Metrics
+    # Update logic to handle labels properly
     QUEUE_DEPTH.labels(tenant_id=job.tenant_id).dec()
+    JOB_LEASE_TOTAL.labels(tenant_id=job.tenant_id, worker_type="pinned" if tenant_id else "shared").inc()
+    from app.api.v1.metrics import JOB_ATTEMPTS_TOTAL
+    JOB_ATTEMPTS_TOTAL.labels(tenant_id=job.tenant_id).inc()
+    
     if job.available_at:
-         # available_at shouldn't be none if it was pending
-         delay = (now - job.available_at.replace(tzinfo=None)).total_seconds()
-         if delay > 0:
-             JOB_LEASE_TIME.observe(delay)
+            # available_at shouldn't be none if it was pending
+            # Both should be timezone-aware (UTC)
+            delay = (now - job.available_at).total_seconds()
+            if delay >= 0:
+                JOB_LEASE_TIME.observe(delay)
     
     # Audit log
     event = JobEventLog(
@@ -109,41 +173,43 @@ async def lease_job(
     
     # Handle Cron Recurrence
     if job.cron_schedule:
-        try:
-            from croniter import croniter
-            # Calculate next run time
-            # base_time: use the job's scheduled available_at to prevent drift, or now if it was immediate
-            # Ensure timezone awareness handling
-            base_time = job.available_at if job.available_at else now
-            iter = croniter(job.cron_schedule, base_time)
-            next_run = iter.get_next(datetime)
-            
-            # Create next job instance
-            next_job = Job(
-                tenant_id=job.tenant_id,
-                payload=job.payload,
-                priority=job.priority, # Inherit base priority
-                idempotency_key=None, # Reset idempotency for new instance (or generate new one?)
-                max_attempts=job.max_attempts,
-                execution_timeout=job.execution_timeout,
-                status=JobStatus.SCHEDULED,
-                available_at=next_run,
-                cron_schedule=job.cron_schedule
-            )
-            session.add(next_job)
-            
-        except ImportError:
-            # In case croniter is missing, we log or ignore? 
-            # For this context, we assume it's installed.
-            print("Warning: croniter not installed, cannot schedule next recurrence.")
-        except Exception as e:
-            print(f"Error scheduling next cron job: {e}")
+        await _handle_cron_recurrence(session, job, now)
 
-    # We commit in the caller usually, but commands might be self-contained?
-    # Usually better to let caller commit to allow composition.
-    # But for a "lease" command, it implies a transaction.
-    # I will flush to ensure integrity but return objects.
-    # Caller responsible for commit to finalize the lease.
     await session.flush()
     
     return job, lease
+
+def _build_job_query(tenant_id, now):
+    return select(Job).where(
+        Job.status == JobStatus.PENDING,
+        Job.available_at <= now,
+        Job.tenant_id == tenant_id
+    ).order_by(
+        Job.priority.desc(),
+        Job.available_at.asc()
+    ).with_for_update(skip_locked=True).limit(1)
+
+async def _handle_cron_recurrence(session, job, now):
+    try:
+        from croniter import croniter
+        base_time = job.available_at if job.available_at else now
+        iter = croniter(job.cron_schedule, base_time)
+        next_run = iter.get_next(datetime)
+        
+        next_job = Job(
+            tenant_id=job.tenant_id,
+            payload=job.payload,
+            priority=job.priority,
+            idempotency_key=None,
+            max_attempts=job.max_attempts,
+            execution_timeout=job.execution_timeout,
+            status=JobStatus.SCHEDULED,
+            available_at=next_run,
+            cron_schedule=job.cron_schedule
+        )
+        session.add(next_job)
+        
+    except ImportError:
+        logger.warning("Warning: croniter not installed, cannot schedule next recurrence.")
+    except Exception as e:
+        logger.error(f"Error scheduling next cron job: {e}")

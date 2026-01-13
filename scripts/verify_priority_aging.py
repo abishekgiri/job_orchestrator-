@@ -26,7 +26,7 @@ async def run_verification():
         await session.commit()
         
         tenant_id = f"test_tenant_{uuid4()}"
-        session.add(Tenant(id=tenant_id, name="Test Tenant"))
+        session.add(Tenant(id=tenant_id, name="Test Tenant", api_key=f"prio-key-{uuid4()}"))
         await session.commit()
         
         logger.info("1. Creating Low Priority Job (Old)")
@@ -66,14 +66,15 @@ async def run_verification():
         
         # Dispatch - High priority should win
         logger.info("4. Dispatching Lease (Expect High Priority)")
-        job, lease = await lease_job(session, worker_id="worker_1")
+        # We pass tenant_id to be explicit since we created jobs for this tenant
+        job, lease = await lease_job(session, worker_id="worker_1", tenant_id=tenant_id)
         logger.info(f"Leased Job ID: {job.id}, Priority: {job.priority}")
         
         assert job.id == high_prio_job.id, "High priority job should be leased first"
         
         # Dispatch again - Low priority (now bumped)
         logger.info("5. Dispatching Lease (Expect Low Priority)")
-        job2, lease2 = await lease_job(session, worker_id="worker_1")
+        job2, lease2 = await lease_job(session, worker_id="worker_1", tenant_id=tenant_id)
         if job2:
              logger.info(f"Leased Job ID: {job2.id}, Priority: {job2.priority}")
              assert job2.id == low_prio_job.id

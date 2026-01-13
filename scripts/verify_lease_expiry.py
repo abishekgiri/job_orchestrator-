@@ -9,14 +9,29 @@ API_URL = "http://localhost:8000"
 
 async def verify_lease_expiry():
     tenant_id = f"tenant-expiry-{uuid.uuid4()}"
+    api_key = f"key-{uuid.uuid4()}"
     
+    # 0. Create Tenant
+    async with AsyncClient(base_url=API_URL) as client:
+        try:
+             await client.post("/api/v1/admin/tenants", json={
+                "id": tenant_id, 
+                "name": "Expiry Test Tenant", 
+                "api_key": api_key
+            })
+        except Exception:
+             pass 
+
     # 1. Create a job
     async with AsyncClient(base_url=API_URL) as client:
         print("1. Creating job...")
-        resp = await client.post("/api/v1/jobs", json={
-            "tenant_id": tenant_id,
-            "payload": {"task": "crash_test"}
-        })
+        resp = await client.post("/api/v1/jobs", 
+            headers={"X-API-Key": api_key},
+            json={
+                "tenant_id": tenant_id,
+                "payload": {"task": "crash_test"}
+            }
+        )
         resp.raise_for_status()
         job = resp.json()
         job_id = job["id"]
@@ -25,11 +40,25 @@ async def verify_lease_expiry():
     # 2. Worker A leases the job with short duration (2 seconds)
     print("2. Worker A polling (lease_duration=2s)...")
     async with AsyncClient(base_url=API_URL) as http_client:
-        poll_resp = await http_client.post("/api/v1/workers/poll", json={
+        # Manual signing for Worker A (since we are doing a raw post)
+        import json, hmac, hashlib
+        payload = {
             "worker_id": "worker-A",
             "tenant_id": tenant_id,
             "lease_duration_seconds": 2
-        })
+        }
+        content = json.dumps(payload).encode("utf-8")
+        sig = hmac.new(api_key.encode(), content, hashlib.sha256).hexdigest()
+        
+        poll_resp = await http_client.post("/api/v1/workers/poll", 
+            content=content,
+            headers={
+                "X-Tenant-ID": tenant_id,
+                "X-Worker-Signature": sig,
+                "Content-Type": "application/json"
+            }
+        )
+        poll_resp.raise_for_status()
         data = poll_resp.json()
         if not data:
             print("   ERROR: Failed to lease job for Worker A")
@@ -52,7 +81,11 @@ async def verify_lease_expiry():
         count = resp.json()["requeued_count"]
         
         # Verify our specific job was reset
-        job_resp = await client.get(f"/api/v1/jobs/{job_id}")
+        job_resp = await client.get(f"/api/v1/jobs/{job_id}", headers={"X-API-Key": api_key})
+        if job_resp.status_code != 200:
+             print(f"FAILED to get job: {job_resp.text}")
+        job_resp.raise_for_status()
+        
         job_status = job_resp.json()['status']
         requeued = "yes" if job_status == "pending" else "no"
         
@@ -62,12 +95,12 @@ async def verify_lease_expiry():
              print(f"   WARNING: Our job {job_id} is {job_status}, expected pending.")
 
     # 6. Worker B polls
-    client_b = WorkerClient(API_URL, worker_id="worker-B")
+    client_b = WorkerClient(API_URL, worker_id="worker-B", tenant_id=tenant_id, api_key=api_key)
     print("6. Worker B polling...")
     # Polling loops until job found or timeout
     found = False
     for _ in range(3):
-        job_data = await client_b.poll(tenant_id=tenant_id)
+        job_data = await client_b.poll() # Client uses tenant_id from init
         if job_data:
             if job_data['job']['id'] == job_id:
                 print(f"   Worker B got the job: {job_id}")
@@ -85,7 +118,7 @@ async def verify_lease_expiry():
     if found:
         # Verify status
         async with httpx.AsyncClient(base_url=API_URL) as client:
-            resp = await client.get(f"/api/v1/jobs/{job_id}")
+            resp = await client.get(f"/api/v1/jobs/{job_id}", headers={"X-API-Key": api_key})
             status = resp.json()['status']
             if status == 'succeeded':
                 print("SUCCESS: Job recovered and completed.")

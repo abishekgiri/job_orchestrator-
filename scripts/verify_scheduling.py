@@ -24,7 +24,7 @@ async def run_verification():
         await session.commit()
         
         tenant_id = f"test_tenant_{uuid4()}"
-        session.add(Tenant(id=tenant_id, name="Test Scheduled Tenant"))
+        session.add(Tenant(id=tenant_id, name="Test Scheduled Tenant", api_key=f"sched-key-{uuid4()}"))
         await session.commit()
         
         logger.info("=== TEST 1: Scheduled Job ===")
@@ -39,7 +39,7 @@ async def run_verification():
         await session.commit()
         
         # 1. Try to lease - Should fail
-        res = await lease_job(session, worker_id="w1")
+        res = await lease_job(session, worker_id="w1", tenant_id=tenant_id)
         assert res is None, "Should not lease scheduled job"
         
         # 2. Wait
@@ -50,7 +50,7 @@ async def run_verification():
         await run_ticker(session)
         
         # 4. Lease - Should succeed
-        res = await lease_job(session, worker_id="w1")
+        res = await lease_job(session, worker_id="w1", tenant_id=tenant_id)
         assert res is not None, "Should lease after time passed + ticker"
         start_time = datetime.now().astimezone()
         logger.info("Scheduled job leased successfully.")
@@ -70,7 +70,7 @@ async def run_verification():
         await session.commit()
         
         # Lease the cron job
-        res = await lease_job(session, worker_id="w1")
+        res = await lease_job(session, worker_id="w1", tenant_id=tenant_id)
         assert res is not None
         job1, lease1 = res
         logger.info(f"Leased Cron Instance 1: {job1.id}")

@@ -17,15 +17,24 @@ class TenantCreate(BaseModel):
     name: str
     weight: int = 1
     max_inflight: int = 100
+    api_key: str | None = None
 
 @router.post("/tenants")
 async def create_tenant(payload: TenantCreate, session: DbSession):
-    tenant = Tenant(
-        id=payload.id,
-        name=payload.name,
-        weight=payload.weight,
-        max_inflight=payload.max_inflight
-    )
-    session.add(tenant)
-    await session.commit()
-    return tenant
+    try:
+        tenant = Tenant(
+            id=payload.id,
+            name=payload.name,
+            weight=payload.weight,
+            max_inflight=payload.max_inflight,
+            api_key=payload.api_key
+        )
+        session.add(tenant)
+        await session.commit()
+        return tenant
+    except Exception:
+        # IntegrityError (Duplicate) or other
+        # Rollback needed for async session?
+        await session.rollback()
+        from fastapi import HTTPException
+        raise HTTPException(status_code=409, detail="Tenant already exists")

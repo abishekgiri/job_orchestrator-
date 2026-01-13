@@ -9,7 +9,7 @@ from app.db.models import Job, JobLease, JobEventLog
 from app.domain.states import JobStatus, JobEvent
 from app.domain.retry import calculate_next_run
 from app.domain.errors import JobNotFoundError
-from app.api.v1.metrics import JOB_FAILURES, QUEUE_DEPTH
+from app.api.v1.metrics import QUEUE_DEPTH, JOB_COMPLETE_TOTAL, JOB_ATTEMPTS_TOTAL, JOB_DLQ_TOTAL, JOBS_INFLIGHT
 
 async def fail_job(
     session: AsyncSession,
@@ -45,7 +45,8 @@ async def fail_job(
             attempts=job.attempts # Update attempts in DB
         ).returning(Job)
         
-        JOB_FAILURES.labels(tenant_id=job.tenant_id, type="final").inc()
+        JOB_COMPLETE_TOTAL.labels(tenant_id=job.tenant_id, result="dlq").inc()
+        JOB_DLQ_TOTAL.labels(tenant_id=job.tenant_id).inc()
         next_event = JobEvent.DLQ_ROUTED
     else:
         # Retry
@@ -58,7 +59,7 @@ async def fail_job(
             attempts=job.attempts # Update attempts in DB
         ).returning(Job)
         
-        JOB_FAILURES.labels(tenant_id=job.tenant_id, type="retryable").inc()
+        JOB_COMPLETE_TOTAL.labels(tenant_id=job.tenant_id, result="retry").inc()
         QUEUE_DEPTH.labels(tenant_id=job.tenant_id).inc() # Back to PENDING
         next_event = JobEvent.RETRIED
 

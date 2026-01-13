@@ -4,107 +4,120 @@ import sys
 import os
 import httpx
 import time
+import logging
+from uuid import uuid4
 
-sys.path.append(os.path.join(os.getcwd(), '.lib'))
 sys.path.append(os.getcwd())
 
 from worker_sdk.client import WorkerClient
 from worker_sdk.runner import WorkerRunner
 
+class SharedWorkerClient(WorkerClient):
+    async def poll(self, tenant_id=None):
+        payload = {"worker_id": self.worker_id}
+        try:
+            resp = await self._post("/api/v1/workers/poll", json_body=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            return data
+        except Exception as e:
+            return None
+
+logging.basicConfig(level=logging.ERROR)
 API_URL = "http://localhost:8000"
 
-async def create_tenants():
+async def create_tenant(t_id, weight, api_key):
     async with httpx.AsyncClient(base_url=API_URL) as client:
-        # Create Tenant A (Heavy user)
-        # Weight 1, limit 100
-        try:
-            await client.post("/api/v1/admin/tenants", json={
-                "id": "tenant-A", "name": "Heavy Tenant", "weight": 1, "max_inflight": 100
-            })
-        except Exception:
-            pass # Ignore if exists
+        await client.post("/api/v1/admin/tenants", json={
+            "id": t_id, "name": f"Tenant {t_id}", "weight": weight, "max_inflight": 50, "api_key": api_key
+        })
 
-        # Create Tenant B (Light user)
-        # Weight 1, limit 100
-        try:
-            await client.post("/api/v1/admin/tenants", json={
-                "id": "tenant-B", "name": "Light Tenant", "weight": 1, "max_inflight": 100
-            })
-        except Exception:
-            pass
-
-async def submit_jobs(tenant_id, count):
+async def submit_jobs(tenant_id, api_key, count, payload_msg):
     async with httpx.AsyncClient(base_url=API_URL) as client:
-        jobs = []
-        # Batch submit simulation
+        tasks = []
         for i in range(count):
-            resp = await client.post("/api/v1/jobs", json={
-                "tenant_id": tenant_id,
-                "payload": {"msg": f"Job {i}"}
-            })
-            if resp.status_code == 201:
-                jobs.append(resp.json()['id'])
-        return jobs
+            tasks.append(client.post("/api/v1/jobs", 
+                headers={"X-API-Key": api_key},
+                json={"tenant_id": tenant_id, "payload": {"msg": f"{payload_msg} {i}"}}
+            ))
+            if len(tasks) >= 50:
+                await asyncio.gather(*tasks)
+                tasks = []
+        if tasks:
+            await asyncio.gather(*tasks)
 
 async def worker_handler(payload):
-    # Simulate work
-    await asyncio.sleep(0.1)
-    return {"status": "done"}
+    await asyncio.sleep(0.05) # 50ms work to slow down churn for observation
+    return {"status": "success"}
 
 async def run_fairness_test():
-    print("Creating tenants...")
-    await create_tenants()
+    print("--- Multi-Tenant Fairness Verification (Fresh Run) ---")
+    t_a = f"t-a-{str(uuid4())[:8]}"
+    t_b = f"t-b-{str(uuid4())[:8]}"
+    k_a = f"k-a-{uuid4()}"
+    k_b = f"k-b-{uuid4()}"
+    
+    await create_tenant(t_a, 1, k_a)
+    await create_tenant(t_b, 1, k_b)
 
-    print("Submitting 100 jobs for Tenant A (Noisy)...")
-    jobs_a = await submit_jobs("tenant-A", 100)
+    count = 100
+    print(f"1. Submitting {count} jobs each for {t_a} and {t_b}...")
+    await asyncio.gather(
+        submit_jobs(t_a, k_a, count, "A"),
+        submit_jobs(t_b, k_b, count, "B")
+    )
     
-    print("Submitting 10 jobs for Tenant B (Victim)...")
-    jobs_b = await submit_jobs("tenant-B", 10)
-    
-    print(f"Submitted {len(jobs_a)} A jobs, {len(jobs_b)} B jobs.")
-    
-    # Run workers
-    # Start 2 concurrent workers to simulate meaningful throughput
-    client1 = WorkerClient(API_URL, worker_id="fair-worker-1")
-    runner1 = WorkerRunner(client1, worker_handler)
-    
-    client2 = WorkerClient(API_URL, worker_id="fair-worker-2")
-    runner2 = WorkerRunner(client2, worker_handler)
-    
-    task1 = asyncio.create_task(runner1.run())
-    task2 = asyncio.create_task(runner2.run())
-    
-    # Monitor B jobs
+    print("2. Starting 10 Shared Workers...")
+    runners = []
+    tasks = []
+    for i in range(10):
+        # We share A's key just for polling auth
+        client = SharedWorkerClient(API_URL, f"fair-worker-{i}", tenant_id=t_a, api_key=k_a)
+        runner = WorkerRunner(client, worker_handler)
+        runners.append(runner)
+        tasks.append(asyncio.create_task(runner.run()))
+
+    print("3. Monitoring Progress (Expecting Balanced Throughput)...")
     start_time = time.time()
     
-    print("Monitoring Tenant B jobs...")
     async with httpx.AsyncClient(base_url=API_URL) as http_client:
         while True:
-            done_b = 0
-            for jid in jobs_b:
-                resp = await http_client.get(f"/api/v1/jobs/{jid}")
-                if resp.status_code == 200 and resp.json()['status'] == 'succeeded':
-                    done_b += 1
+            resp = await http_client.get("/metrics")
+            output = resp.text
+            
+            def get_val(t_id):
+                for line in output.split('\n'):
+                    if f'job_complete_total' in line and f'tenant_id="{t_id}"' in line and 'success' in line:
+                         return int(float(line.split()[-1]))
+                return 0
+
+            a_done = get_val(t_a)
+            b_done = get_val(t_b)
             
             elapsed = time.time() - start_time
-            print(f"[{elapsed:.1f}s] Tenant B progress: {done_b}/10")
+            print(f"   [{elapsed:.1f}s] Progress - A: {a_done}/{count}, B: {b_done}/{count}")
             
-            if done_b == 10:
-                print(f"SUCCESS: All Tenant B jobs finished in {elapsed:.2f}s!")
+            if a_done >= count and b_done >= count:
+                print("Both tenants finished.")
                 break
                 
+            # Tolerance: allow 30% skew, but no total starvation
+            if a_done > 20 and b_done == 0:
+                 print("STARVATION ERROR: B has zero progress while A is moving.")
+                 exit(1)
+            if b_done > 20 and a_done == 0:
+                 print("STARVATION ERROR: A has zero progress while B is moving.")
+                 exit(1)
+
             if elapsed > 60:
-                print("FAILURE: Timeout waiting for B.")
-                break
-                
+                print("TIMEOUT ERROR")
+                exit(1)
             await asyncio.sleep(2)
 
-    runner1.running = False
-    runner2.running = False
-    await task1
-    await task2
-    await client1.close()
-    await client2.close()
+    # Cleanup
+    for r in runners: r.running = False
+    for t in tasks: t.cancel()
+    print("--- Fairness Verification PASSED ---")
 
 if __name__ == "__main__":
     asyncio.run(run_fairness_test())

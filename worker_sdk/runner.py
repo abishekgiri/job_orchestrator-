@@ -57,7 +57,6 @@ class WorkerRunner:
             # Fail
             error_msg = f"{type(e).__name__}: {str(e)}"
             logger.error(f"Job {job_id} failed: {error_msg}")
-            # traceback.print_exc()
             await self.client.fail(job_id, lease_token, error_msg)
             
         finally:

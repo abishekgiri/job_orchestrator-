@@ -3,46 +3,72 @@ import requests
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-BASE_URL = "http://localhost:8000/api/v1"
-NUM_JOBS = 2000          # Total jobs to inject
-CONCURRENT_WORKERS = 20  # Number of parallel threads simulating workers
+import hashlib
+import hmac
+import json
+import uuid
+
+# ... imports ...
+
+import os
+
+# ... imports ...
+
+BASE_URL = os.getenv("JOB_API_URL", "http://localhost:8000/api/v1")
+NUM_JOBS = 2000          
+CONCURRENT_WORKERS = 20 
+
+TENANT_ID = "bench"
+API_KEY = os.getenv("JOB_API_KEY", "bench-key")
+
+def setup_tenant():
+    try:
+        requests.post(f"{BASE_URL}/admin/tenants", json={
+            "id": TENANT_ID,
+            "name": "Benchmark Tenant",
+            "api_key": API_KEY,
+            "max_inflight": 2000
+        })
+    except Exception:
+        pass
 
 def create_jobs_batch(n):
     start = time.time()
-    
-    # We could optimize injection with concurrency too, but sequential injection measures API write latency better
-    # Let's simple injecting sequentially for now or use session for keep-alive
     with requests.Session() as s:
         for i in range(n):
-            # Minimal payload for speed
-            resp = s.post(f"{BASE_URL}/jobs", json={"tenant_id": "bench", "payload": {"msg": f"bench_{i}"}})
+            resp = s.post(f"{BASE_URL}/jobs", 
+                headers={"X-API-Key": API_KEY},
+                json={"tenant_id": TENANT_ID, "payload": {"msg": f"bench_{i}"}}
+            )
             if resp.status_code >= 400:
                 print(f"Failed to create job {i}: {resp.text}", file=sys.stderr)
-                
     duration = time.time() - start
     rate = n / duration if duration > 0 else 0
     return rate
 
 def worker_routine(worker_id):
     processed = 0
+    wid = f"bench_w_{worker_id}"
     with requests.Session() as s:
         while True:
             try:
-                # Poll
-                # Note: Our poll endpoint returns empty list [] or null?
-                # The script provided by user checks 204.
-                # My implementation returns `null` (None) or `[]` depending on implementation.
-                # `app/api/v1/workers.py`: `if not result: return None` -> 200 OK with "null" body?
-                # Let's check: FastAPI return None usually means null JSON.
-                # Previous test checked `if not jobs`.
+                # Poll with Signature
+                payload = {"worker_id": wid, "tenant_id": TENANT_ID}
+                content = json.dumps(payload).encode("utf-8")
+                sig = hmac.new(API_KEY.encode(), content, hashlib.sha256).hexdigest()
                 
-                resp = s.post(f"{BASE_URL}/workers/poll", json={"worker_id": f"bench_w_{worker_id}", "tenant_id": "bench"})
+                resp = s.post(f"{BASE_URL}/workers/poll", 
+                    data=content,
+                    headers={
+                        "X-Tenant-ID": TENANT_ID, 
+                        "X-Worker-Signature": sig,
+                        "Content-Type": "application/json"
+                    }
+                )
                 
-                # Handling empty queue
-                # API returns 200 OK with `null` or empty list.
                 if resp.status_code == 200:
                     data = resp.json()
-                    if not data: # None or []
+                    if not data:
                         break
                 elif resp.status_code == 204:
                     break
@@ -50,23 +76,30 @@ def worker_routine(worker_id):
                     print(f"Poll Error: {resp.status_code}")
                     break
                 
-                # Check data format
-                # My poll returns `PollResponse` or list.
-                # Implementation: `return PollResponse(...)` (Step 955)
-                # It returns a single object.
-                
                 job_id = data.get("job", {}).get("id")
                 lease_token = data.get("lease_token")
                 
                 if not job_id:
                      break
                 
-                # Complete
-                c_resp = s.post(f"{BASE_URL}/workers/{job_id}/complete", json={
-                    "worker_id": f"bench_w_{worker_id}",
-                    "result": {"bench": "ok"},
-                    "lease_token": lease_token
-                })
+                # Complete with Signature
+                c_payload = {
+                    "worker_id": wid,
+                    "lease_token": lease_token,
+                    "result": {"bench": "ok"}
+                }
+                c_content = json.dumps(c_payload).encode("utf-8")
+                c_sig = hmac.new(API_KEY.encode(), c_content, hashlib.sha256).hexdigest()
+                
+                c_resp = s.post(f"{BASE_URL}/workers/{job_id}/complete", 
+                    data=c_content,
+                    headers={
+                        "X-Tenant-ID": TENANT_ID, 
+                        "X-Worker-Signature": c_sig,
+                        "Content-Type": "application/json"
+                    }
+                )
+
                 if c_resp.status_code != 200:
                      print(f"Complete Error: {c_resp.status_code}")
                 
@@ -79,6 +112,7 @@ def worker_routine(worker_id):
 
 def run_benchmark():
     print(f"Using API: {BASE_URL}")
+    setup_tenant()
     injection_rate = create_jobs_batch(NUM_JOBS)
     
     start_time = time.time()

@@ -1,46 +1,51 @@
-.PHONY: up down migrate verify test-e2e test-expiry test-concurrency test-retry test-idempotency test-timeout benchmark demo
+SHELL := /bin/bash
+PYTHONPATH := .
+COMPOSE := docker-compose -f docker/docker-compose.yml
 
-# --- Core Infrastructure ---
+.PHONY: up down reset migrate verify verify-ci bench logs
+
+# --- Infrastructure ---
 up:
-	docker-compose -f docker/docker-compose.yml up -d --build
+	$(COMPOSE) up -d --build
 
 down:
-	docker-compose -f docker/docker-compose.yml down
+	$(COMPOSE) down --remove-orphans
 
 reset:
-	docker-compose -f docker/docker-compose.yml down -v --remove-orphans
-
-logs:
-	docker-compose -f docker/docker-compose.yml logs -f --tail=100
+	$(COMPOSE) down -v --remove-orphans
+	$(COMPOSE) up -d --build
 
 migrate:
 	./scripts/run_alembic.py upgrade head
 
-# --- Verification Suite ---
-# Run all verifications
-verify: migrate verify-e2e test-expiry test-concurrency test-retry test-idempotency test-timeout
+# --- Verification ---
+# Full state-of-the-art verification suite
+verify: reset migrate
+	PYTHONPATH=$(PYTHONPATH) ./scripts/verify_e2e.py
+	PYTHONPATH=$(PYTHONPATH) ./scripts/verify_lease_expiry.py
+	PYTHONPATH=$(PYTHONPATH) ./scripts/verify_no_double_claim.py
+	PYTHONPATH=$(PYTHONPATH) ./scripts/verify_retry_dlq.py
+	PYTHONPATH=$(PYTHONPATH) ./scripts/verify_idempotency.py
+	PYTHONPATH=$(PYTHONPATH) python3 ./scripts/verify_execution_timeout.py
+	PYTHONPATH=$(PYTHONPATH) python3 ./scripts/verify_fairness.py
+	PYTHONPATH=$(PYTHONPATH) python3 ./scripts/verify_priority_aging.py
+	PYTHONPATH=$(PYTHONPATH) python3 ./scripts/verify_scheduling.py
+	PYTHONPATH=$(PYTHONPATH) python3 ./scripts/verify_outbox.py
+	PYTHONPATH=$(PYTHONPATH) python3 ./scripts/verify_observability.py
+	PYTHONPATH=$(PYTHONPATH) python3 ./scripts/benchmark.py
 
-verify-e2e:
-	PYTHONPATH=. ./scripts/verify_e2e.py
+# Faster verification for CI/CD environments
+verify-ci: reset migrate
+	PYTHONPATH=$(PYTHONPATH) ./scripts/verify_e2e.py
+	PYTHONPATH=$(PYTHONPATH) ./scripts/verify_no_double_claim.py
+	PYTHONPATH=$(PYTHONPATH) ./scripts/verify_retry_dlq.py
+	PYTHONPATH=$(PYTHONPATH) ./scripts/verify_idempotency.py
+	PYTHONPATH=$(PYTHONPATH) python3 ./scripts/verify_outbox.py
+	PYTHONPATH=$(PYTHONPATH) python3 ./scripts/verify_observability.py
 
-test-expiry:
-	PYTHONPATH=. ./scripts/verify_lease_expiry.py
+# --- Utilities ---
+bench:
+	PYTHONPATH=$(PYTHONPATH) python3 ./scripts/benchmark.py
 
-test-concurrency:
-	PYTHONPATH=. ./scripts/verify_no_double_claim.py
-
-test-retry:
-	PYTHONPATH=. ./scripts/verify_retry_dlq.py
-
-test-idempotency:
-	PYTHONPATH=. ./scripts/verify_idempotency.py
-
-test-timeout:
-	PYTHONPATH=. python3 ./scripts/verify_execution_timeout.py
-
-# --- Performance ---
-benchmark:
-	PYTHONPATH=. python3 ./scripts/benchmark.py
-
-# --- The Perfect Demo ---
-demo: reset up verify benchmark
+logs:
+	$(COMPOSE) logs -f --tail=200

@@ -22,6 +22,9 @@ class Tenant(Base):
     # Tracking
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"), onupdate=text("now()"))
+    
+    # Security
+    api_key: Mapped[Optional[str]] = mapped_column(String, unique=True, nullable=True)
 
     jobs: Mapped[list["Job"]] = relationship("Job", back_populates="tenant")
 
@@ -99,3 +102,17 @@ class JobCompletion(Base):
     job_id: Mapped[UUID] = mapped_column(PG_UUID(as_uuid=True), ForeignKey("jobs.id", ondelete="CASCADE"), primary_key=True)
     idempotency_key: Mapped[str] = mapped_column(String, primary_key=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
+
+class OutboxEvent(Base):
+    __tablename__ = "outbox_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    event_type: Mapped[str] = mapped_column(String, nullable=False)
+    payload: Mapped[dict[str, Any]] = mapped_column(JSONB, default={})
+    
+    # Status: PENDING, PUBLISHED, FAILED
+    status: Mapped[str] = mapped_column(String, default="PENDING", index=True)
+    
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=text("now()"))
+    published_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
+

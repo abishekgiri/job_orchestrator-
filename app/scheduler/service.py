@@ -1,7 +1,7 @@
 import asyncio
 import logging
 from app.db.session import AsyncSessionLocal
-from app.scheduler.ticker import run_ticker
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,20 +42,23 @@ class SchedulerService:
                 # Best to ensure we have it.
                 is_leader = await try_advisory_lock(session)
                 
-                from app.api.v1.metrics import LEADER_STATUS
-                LEADER_STATUS.set(1 if is_leader else 0)
+                from app.scheduler.ticker import run_leader_tasks, run_metrics_tasks
                 
+                # Execute Leader Tasks
                 if is_leader:
                     if not self._is_leader:
-                        logger.info("Acquired leadership. Starting ticker.")
+                        logger.info("Acquired leadership. Starting scheduler.")
                         self._is_leader = True
                     
-                    # Run ticker
-                    await run_ticker(session)
+                    await run_leader_tasks(session)
                 else:
                     if self._is_leader:
-                        logger.info("Lost leadership. Stopping ticker.")
+                        logger.info("Lost leadership. Stopping scheduler.")
                         self._is_leader = False
+                
+                # Execute Metrics Tasks (On All Instances)
+                # This ensures /metrics endpoint has up-to-date gauges (like jobs_inflight)
+                await run_metrics_tasks(session)
                     
             except Exception as e:
                 logger.error(f"Error in scheduler ticker: {e}", exc_info=True)
