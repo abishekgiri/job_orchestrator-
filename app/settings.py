@@ -38,4 +38,9 @@ class Settings(BaseSettings):
     # Redis (Optional mostly for rate limiting if we get to it)
     REDIS_URL: str = "redis://localhost:6379/0"
 
+    # Admin/API security
+    ADMIN_API_KEY: Optional[str] = None
+    ALLOW_INSECURE_ADMIN: bool = False
+    LOG_BOOTSTRAP_KEYS: bool = False
+
 settings = Settings()

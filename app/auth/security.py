@@ -9,6 +9,7 @@ from sqlalchemy import select
 
 from app.api.deps import DbSession
 from app.db.models import Tenant
+from app.settings import settings
 
 logger = logging.getLogger(__name__)
 
@@ -97,6 +98,8 @@ class SignatureVerifier:
         tenant_id = request.headers.get("X-Tenant-ID")
         if not tenant_id:
              raise HTTPException(status_code=400, detail="Missing X-Tenant-ID")
+        if not x_signature:
+             raise HTTPException(status_code=401, detail="Missing Signature")
              
         stmt = select(Tenant).where(Tenant.id == tenant_id)
         tenant = await session.scalar(stmt)
@@ -115,3 +118,12 @@ class SignatureVerifier:
              raise HTTPException(status_code=401, detail="Invalid Signature")
              
         return tenant
+
+async def require_admin(x_admin_key: str = Header(default=None, alias="X-Admin-Key")):
+    if settings.ALLOW_INSECURE_ADMIN:
+        return True
+    if not settings.ADMIN_API_KEY:
+        raise HTTPException(status_code=503, detail="Admin key not configured")
+    if not x_admin_key or not hmac.compare_digest(x_admin_key, settings.ADMIN_API_KEY):
+        raise HTTPException(status_code=403, detail="Invalid admin key")
+    return True

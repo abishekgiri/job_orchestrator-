@@ -23,19 +23,21 @@ class WorkerClient:
             pass
         return headers
 
-    async def _post(self, path: str, json_body: dict):
+    async def _post(self, path: str, json_body: dict, tenant_id: Optional[str] = None, api_key: Optional[str] = None):
         headers = {}
         content = None
+        effective_tenant = tenant_id or self.tenant_id
+        effective_key = api_key or self.api_key
         
-        if self.tenant_id:
-            headers["X-Tenant-ID"] = self.tenant_id
+        if effective_tenant:
+            headers["X-Tenant-ID"] = effective_tenant
             
-        if self.tenant_id and self.api_key:
+        if effective_tenant and effective_key:
             # Deterministic serialization for signing
             # We use json.dumps() and send as content
             content = json.dumps(json_body).encode("utf-8")
             sig = hmac.new(
-                self.api_key.encode("utf-8"),
+                effective_key.encode("utf-8"),
                 content,
                 hashlib.sha256
             ).hexdigest()
@@ -62,7 +64,7 @@ class WorkerClient:
             # But wait, self._post uses self.tenant_id.
             # If poll calls with different tenant_id, signing might be wrong if key belongs to one tenant?
             # Let's assume Worker runs for ONE tenant if security is enabled.
-            resp = await self._post("/api/v1/workers/poll", json_body=payload)
+            resp = await self._post("/api/v1/workers/poll", json_body=payload, tenant_id=tid, api_key=self.api_key)
             resp.raise_for_status()
             data = resp.json()
             if not data:

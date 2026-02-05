@@ -1,13 +1,14 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from app.api.deps import DbSession
 from app.commands.requeue_expired import requeue_expired_jobs
 from app.db.models import Tenant
+from app.auth.security import require_admin
 from pydantic import BaseModel
 
 router = APIRouter()
 
 @router.post("/requeue_expired")
-async def trigger_requeue_expired(session: DbSession):
+async def trigger_requeue_expired(session: DbSession, _: bool = Depends(require_admin)):
     count = await requeue_expired_jobs(session)
     await session.commit()
     return {"requeued_count": count}
@@ -20,7 +21,7 @@ class TenantCreate(BaseModel):
     api_key: str | None = None
 
 @router.post("/tenants")
-async def create_tenant(payload: TenantCreate, session: DbSession):
+async def create_tenant(payload: TenantCreate, session: DbSession, _: bool = Depends(require_admin)):
     try:
         tenant = Tenant(
             id=payload.id,

@@ -34,24 +34,20 @@ async def complete_job(
         raise JobNotFoundError(job_id)
         
     # Idempotency Check
-    # Idempotency Check
     if idempotency_key:
         # Check if already processed (Avoid rollback/exception path)
-        stmt = select(JobCompletion).where(JobCompletion.idempotency_key == idempotency_key)
+        stmt = select(JobCompletion).where(
+            JobCompletion.job_id == job_id,
+            JobCompletion.idempotency_key == idempotency_key
+        )
         existing = await session.scalar(stmt)
         
         if existing:
             # Already processed. Return success.
-            if job.status == JobStatus.SUCCEEDED:
-                 return job
-            
-            # If job not succeeded but key exists?
-            # Re-fetch job to be sure
             job_refresh = await session.get(Job, job_id)
             if job_refresh.status == JobStatus.SUCCEEDED:
                  return job_refresh
-            
-            return job_refresh or job
+            raise InvalidJobStateError(job_refresh.status if job_refresh else "unknown", JobStatus.SUCCEEDED)
 
         try:
             # Try to record this completion attempt
@@ -66,7 +62,7 @@ async def complete_job(
             job = await session.get(Job, job_id)
             if job and job.status == JobStatus.SUCCEEDED:
                 return job
-            return job 
+            raise InvalidJobStateError(job.status if job else "unknown", JobStatus.SUCCEEDED)
 
     # Validation
     if job.status != JobStatus.LEASED and job.status != JobStatus.RUNNING:

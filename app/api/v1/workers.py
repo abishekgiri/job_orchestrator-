@@ -3,6 +3,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, status
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy import select
 
 from app.api.deps import DbSession
 from app.db.models import Job
@@ -57,10 +58,12 @@ from app.db.models import Tenant
 
 @router.post("/poll", response_model=Optional[PollResponse])
 async def poll_job(body: PollRequest, session: DbSession, tenant: Tenant = Depends(SignatureVerifier())):
+    if body.tenant_id and body.tenant_id != tenant.id:
+        raise HTTPException(status_code=403, detail="Tenant mismatch")
     result = await dispatch_lease(
         session, 
         worker_id=body.worker_id, 
-        tenant_id=body.tenant_id,
+        tenant_id=tenant.id,
         lease_duration=body.lease_duration_seconds
     )
     if not result:
@@ -79,6 +82,7 @@ async def poll_job(body: PollRequest, session: DbSession, tenant: Tenant = Depen
 
 @router.post("/{job_id}/heartbeat")
 async def job_heartbeat(job_id: UUID, body: HeartbeatRequest, session: DbSession, tenant: Tenant = Depends(SignatureVerifier())):
+    await _require_job_tenant(session, job_id, tenant.id)
     try:
         new_expires_at = await heartbeat(
             session, 
@@ -93,6 +97,7 @@ async def job_heartbeat(job_id: UUID, body: HeartbeatRequest, session: DbSession
 
 @router.post("/{job_id}/complete")
 async def job_complete(job_id: UUID, body: CompleteRequest, session: DbSession, tenant: Tenant = Depends(SignatureVerifier())):
+    await _require_job_tenant(session, job_id, tenant.id)
     try:
         job = await complete_job(
             session, 
@@ -108,6 +113,7 @@ async def job_complete(job_id: UUID, body: CompleteRequest, session: DbSession, 
 
 @router.post("/{job_id}/fail")
 async def job_fail(job_id: UUID, body: FailRequest, session: DbSession, tenant: Tenant = Depends(SignatureVerifier())):
+    await _require_job_tenant(session, job_id, tenant.id)
     try:
         job = await fail_job(
             session, 
@@ -119,3 +125,9 @@ async def job_fail(job_id: UUID, body: FailRequest, session: DbSession, tenant: 
         return {"status": "failed", "job_status": job.status} # PENDING (retry) or DLQ
     except JobError as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+async def _require_job_tenant(session: DbSession, job_id: UUID, tenant_id: str) -> None:
+    stmt = select(Job.id).where(Job.id == job_id, Job.tenant_id == tenant_id)
+    exists = await session.scalar(stmt)
+    if not exists:
+        raise HTTPException(status_code=404, detail="Job not found")

@@ -4,11 +4,11 @@ from uuid import UUID
 
 from fastapi import APIRouter, HTTPException, BackgroundTasks, status
 from pydantic import BaseModel, ConfigDict
-from sqlalchemy import select, update
+from sqlalchemy import select, update, delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import DbSession
-from app.db.models import Job, JobEventLog
+from app.db.models import Job, JobEventLog, JobLease
 from app.domain.states import JobStatus, JobEvent
 from app.api.v1.metrics import QUEUE_DEPTH
 
@@ -111,20 +111,23 @@ async def get_job(job_id: UUID, session: DbSession, current_tenant: Tenant = Dep
     return job
 
 @router.post("/{job_id}/cancel", response_model=JobResponse)
-async def cancel_job(job_id: UUID, session: DbSession):
+async def cancel_job(job_id: UUID, session: DbSession, current_tenant: Tenant = Depends(get_current_tenant)):
     job = await session.get(Job, job_id)
     if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+        
+    if job.tenant_id != current_tenant.id:
         raise HTTPException(status_code=404, detail="Job not found")
         
     if job.status in [JobStatus.SUCCEEDED, JobStatus.FAILED_FINAL, JobStatus.CANCELED]:
         return job
         
     job.status = JobStatus.CANCELED
-    job.updated_at = datetime.now() # error: import datetime
+    job.updated_at = datetime.now().astimezone()
     
     # We should delete lease if exists? 
     # Yes, cancellation should kill lease
-    # (logic omitted for brevity, but crucial for production)
+    await session.execute(delete(JobLease).where(JobLease.job_id == job.id))
     
     session.add(JobEventLog(
         job_id=job.id,

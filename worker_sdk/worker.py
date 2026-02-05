@@ -13,8 +13,8 @@ Handler = Callable[[dict], Coroutine[Any, Any, dict]]
 Middleware = Callable[[dict, Handler], Coroutine[Any, Any, dict]]
 
 class Worker:
-    def __init__(self, base_url: str, worker_id: str, handler: Handler, tenant_id: Optional[str] = None):
-        self.client = WorkerClient(base_url, worker_id)
+    def __init__(self, base_url: str, worker_id: str, handler: Handler, tenant_id: Optional[str] = None, api_key: Optional[str] = None):
+        self.client = WorkerClient(base_url, worker_id, tenant_id=tenant_id, api_key=api_key)
         self.handler = handler
         self.tenant_id = tenant_id
         self.running = False

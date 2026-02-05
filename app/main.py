@@ -6,6 +6,13 @@ from app.api.v1.workers import router as workers_router
 from app.api.v1.admin import router as admin_router
 from app.api.v1.metrics import router as metrics_router
 
+def _redact_secret(value: str, show: int = 4) -> str:
+    if not value:
+        return "<empty>"
+    if len(value) <= show * 2:
+        return "*" * len(value)
+    return f"{value[:show]}...{value[-show:]}"
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
@@ -35,10 +42,12 @@ async def lifespan(app: FastAPI):
                     t = Tenant(id="local-dev", name="Local Dev Tenant", api_key=new_key)
                     session.add(t)
                     await session.commit()
-                    logger.info(f"\n{'='*40}\nBOOTSTRAP: Created 'local-dev' Tenant.\nAPI KEY: {new_key}\n{'='*40}\n")
+                    display_key = new_key if settings.LOG_BOOTSTRAP_KEYS else _redact_secret(new_key)
+                    logger.info(f"\n{'='*40}\nBOOTSTRAP: Created 'local-dev' Tenant.\nAPI KEY: {display_key}\n{'='*40}\n")
                 else:
                     if t.api_key:
-                        logger.info(f"\n{'='*40}\nBOOTSTRAP: Found 'local-dev' Tenant.\nAPI KEY: {t.api_key}\n{'='*40}\n")
+                        display_key = t.api_key if settings.LOG_BOOTSTRAP_KEYS else _redact_secret(t.api_key)
+                        logger.info(f"\n{'='*40}\nBOOTSTRAP: Found 'local-dev' Tenant.\nAPI KEY: {display_key}\n{'='*40}\n")
                     else:
                          logger.info(f"BOOTSTRAP: Found 'local-dev' Tenant (No API Key).")
             # If successful, break
