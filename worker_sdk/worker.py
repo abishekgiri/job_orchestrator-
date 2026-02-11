@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import signal
-import sys
 from typing import Callable, Any, Coroutine, Optional, List
 from uuid import UUID
 
@@ -13,8 +12,20 @@ Handler = Callable[[dict], Coroutine[Any, Any, dict]]
 Middleware = Callable[[dict, Handler], Coroutine[Any, Any, dict]]
 
 class Worker:
-    def __init__(self, base_url: str, worker_id: str, handler: Handler, tenant_id: Optional[str] = None):
-        self.client = WorkerClient(base_url, worker_id)
+    def __init__(
+        self,
+        base_url: str,
+        worker_id: str,
+        handler: Handler,
+        tenant_id: Optional[str] = None,
+        api_key: Optional[str] = None,
+    ):
+        self.client = WorkerClient(
+            base_url,
+            worker_id,
+            tenant_id=tenant_id,
+            api_key=api_key,
+        )
         self.handler = handler
         self.tenant_id = tenant_id
         self.running = False
@@ -26,14 +37,15 @@ class Worker:
 
     async def run(self):
         self.running = True
+        self._shutdown_event.clear()
         
         # Setup signal handlers
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
                 loop.add_signal_handler(sig, self.stop)
-            except NotImplementedError:
-                # Windows support
+            except (NotImplementedError, RuntimeError):
+                # Windows / non-main-thread support
                 pass
                 
         logger.info(f"Worker {self.client.worker_id} started (Tenant: {self.tenant_id})")
@@ -54,7 +66,7 @@ class Worker:
                             pass
                             
                 except Exception as e:
-                    logger.error(f"Poll error: {e}")
+                    logger.exception("Poll loop error for worker %s: %s", self.client.worker_id, e)
                     await asyncio.sleep(5.0)
                     
         finally:
@@ -96,12 +108,20 @@ class Worker:
             result = await chain(job['payload'])
             
             # Complete
-            await self.client.complete(job_id, lease_token, result)
-            logger.info(f"Job {job_id} completed")
+            completed = await self.client.complete(job_id, lease_token, result)
+            if completed:
+                logger.info(f"Job {job_id} completed")
+            else:
+                logger.error(
+                    "Job %s handler succeeded but completion ACK failed; lease may be retried",
+                    job_id,
+                )
             
         except Exception as e:
             logger.error(f"Job {job_id} failed: {e}")
-            await self.client.fail(job_id, lease_token, str(e))
+            failed = await self.client.fail(job_id, lease_token, str(e))
+            if not failed:
+                logger.error("Failed to report failure for job %s", job_id)
             
         finally:
             heartbeat_task.cancel()
@@ -112,8 +132,10 @@ class Worker:
 
     async def _heartbeat_loop(self, job_id: UUID, lease_token: UUID):
         try:
-            while True:
+            while self.running:
                 await asyncio.sleep(10)
+                if not self.running:
+                    break
                 if not await self.client.heartbeat(job_id, lease_token):
                     logger.warning(f"Heartbeat failed for {job_id}")
                     # Should we abort? Probably.

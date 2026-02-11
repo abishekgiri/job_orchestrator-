@@ -1,9 +1,13 @@
-import httpx
 import hashlib
 import hmac
 import json
-from typing import Optional, Any, Dict, Union
+import logging
+from typing import Any, Dict, Optional
 from uuid import UUID
+
+import httpx
+
+logger = logging.getLogger(__name__)
 
 class WorkerClient:
     def __init__(self, base_url: str, worker_id: str, tenant_id: Optional[str] = None, api_key: Optional[str] = None):
@@ -13,63 +17,69 @@ class WorkerClient:
         self.api_key = api_key
         self.client = httpx.AsyncClient(base_url=self.base_url, timeout=10.0)
 
-    def _sign_request(self, payload: dict) -> Dict[str, str]:
+    @staticmethod
+    def _serialize_body(json_body: Dict[str, Any]) -> bytes:
+        # Stable encoding keeps signatures deterministic and payloads compact.
+        return json.dumps(json_body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+
+    def _build_headers(self, tenant_id: Optional[str], body: Optional[bytes] = None) -> Dict[str, str]:
         headers = {}
-        if self.tenant_id:
-            headers["X-Tenant-ID"] = self.tenant_id
-            
-        if self.tenant_id and self.api_key:
-            # Note: Signature verification requires exact byte-matching of the payload.
-            pass
+        if tenant_id:
+            headers["X-Tenant-ID"] = tenant_id
+
+        if self.api_key:
+            if not tenant_id:
+                raise ValueError("tenant_id is required when api_key is configured")
+            if body is None:
+                raise ValueError("request body is required for signed worker requests")
+            signature = hmac.new(
+                self.api_key.encode("utf-8"),
+                body,
+                hashlib.sha256,
+            ).hexdigest()
+            headers["X-Worker-Signature"] = signature
+            headers["Content-Type"] = "application/json"
+
         return headers
 
-    async def _post(self, path: str, json_body: dict):
-        headers = {}
-        content = None
-        
-        if self.tenant_id:
-            headers["X-Tenant-ID"] = self.tenant_id
-            
-        if self.tenant_id and self.api_key:
-            # Deterministic serialization for signing
-            # We use json.dumps() and send as content
-            content = json.dumps(json_body).encode("utf-8")
-            sig = hmac.new(
-                self.api_key.encode("utf-8"),
-                content,
-                hashlib.sha256
-            ).hexdigest()
-            headers["X-Worker-Signature"] = sig
-            headers["Content-Type"] = "application/json"
-            
+    async def _post(self, path: str, json_body: Dict[str, Any], tenant_id: Optional[str] = None) -> httpx.Response:
+        effective_tenant_id = tenant_id or self.tenant_id
+
+        if self.api_key:
+            content = self._serialize_body(json_body)
+            headers = self._build_headers(effective_tenant_id, content)
             return await self.client.post(path, content=content, headers=headers)
-        else:
-            return await self.client.post(path, json=json_body, headers=headers)
+
+        headers = self._build_headers(effective_tenant_id)
+        return await self.client.post(path, json=json_body, headers=headers)
 
     async def poll(self, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
         """
         Polls for a job.
         """
-        # Override self.tenant_id if provided?
         tid = tenant_id or self.tenant_id
-        
+
         payload = {"worker_id": self.worker_id}
         if tid:
             payload["tenant_id"] = tid
-            
+
         try:
-            # We use internal _post to handle signing
-            # But wait, self._post uses self.tenant_id.
-            # If poll calls with different tenant_id, signing might be wrong if key belongs to one tenant?
-            # Let's assume Worker runs for ONE tenant if security is enabled.
-            resp = await self._post("/api/v1/workers/poll", json_body=payload)
+            resp = await self._post("/api/v1/workers/poll", json_body=payload, tenant_id=tid)
             resp.raise_for_status()
             data = resp.json()
-            if not data:
-                return None
-            return data
-        except httpx.HTTPError as e:
-            print(f"Poll error: {e}")
+            return data or None
+        except httpx.HTTPStatusError as e:
+            status_code = e.response.status_code
+            log_fn = logger.info if status_code in (401, 403, 422) else logger.warning
+            log_fn(
+                "Poll rejected for worker=%s tenant=%s status=%s",
+                self.worker_id,
+                tid,
+                status_code,
+            )
+            return None
+        except (httpx.HTTPError, ValueError) as e:
+            logger.error("Poll failed for worker=%s tenant=%s: %s", self.worker_id, tid, e)
             return None
 
     async def heartbeat(self, job_id: UUID, lease_token: UUID) -> bool:
@@ -83,7 +93,8 @@ class WorkerClient:
             )
             resp.raise_for_status()
             return True
-        except httpx.HTTPError:
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning("Heartbeat failed for worker=%s job=%s: %s", self.worker_id, job_id, e)
             return False
 
     async def complete(self, job_id: UUID, lease_token: UUID, result: Dict[str, Any]) -> bool:
@@ -98,7 +109,8 @@ class WorkerClient:
             )
             resp.raise_for_status()
             return True
-        except httpx.HTTPError:
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning("Complete failed for worker=%s job=%s: %s", self.worker_id, job_id, e)
             return False
 
     async def fail(self, job_id: UUID, lease_token: UUID, error: str) -> bool:
@@ -113,7 +125,8 @@ class WorkerClient:
             )
             resp.raise_for_status()
             return True
-        except httpx.HTTPError:
+        except (httpx.HTTPError, ValueError) as e:
+            logger.warning("Fail request failed for worker=%s job=%s: %s", self.worker_id, job_id, e)
             return False
             
     async def close(self):
